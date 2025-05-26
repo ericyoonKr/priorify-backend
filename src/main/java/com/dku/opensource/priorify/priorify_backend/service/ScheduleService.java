@@ -3,6 +3,8 @@ package com.dku.opensource.priorify.priorify_backend.service;
 import com.dku.opensource.priorify.priorify_backend.dto.*;
 import com.dku.opensource.priorify.priorify_backend.model.Schedule;
 import com.dku.opensource.priorify.priorify_backend.model.User;
+import com.dku.opensource.priorify.priorify_backend.model.CategoryPriority;
+
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -12,6 +14,7 @@ import org.springframework.data.mongodb.core.aggregation.AggregationResults;
 import org.springframework.data.mongodb.core.query.Criteria;
 import org.springframework.data.mongodb.core.query.Query;
 import org.springframework.stereotype.Service;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.bson.Document;
 import org.bson.types.ObjectId;
 
@@ -20,6 +23,8 @@ import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.stream.Collectors;
+import javax.mail.MessagingException;
+
 
 @Service
 @RequiredArgsConstructor
@@ -28,6 +33,7 @@ public class ScheduleService {
     
     private final MongoTemplate mongoTemplate;
     private final UserService userService;
+    private final EmailService emailService;
     
     // 중요도 계산 상수
     private static final double URGENCY_COEFFICIENT_A = 0.02;
@@ -514,4 +520,89 @@ public class ScheduleService {
                 })
                 .collect(Collectors.toList());
     }
-} 
+
+
+    @Scheduled(cron = "0 0 0 * * ?") // 매일 0시 0분 0초에 실행
+    public void sendDailyScheduleReminders() {
+        log.info("스케줄 알림 작업 시작 at {}", LocalDateTime.now());
+
+        // userService.findAll() 사용 (MongoRepository 기본 제공 메소드)
+        List<User> users = userService.findAll(); // 모든 사용자 조회
+
+        LocalDateTime now = LocalDateTime.now();
+        LocalDateTime startOfToday = now.truncatedTo(ChronoUnit.DAYS); // 오늘 0시 0분 0초 (시간 정보 제거)
+
+        for (User user : users) {
+            // 사용자에게 이메일 주소가 없으면 건너뛰기
+            if (user.getEmail() == null || user.getEmail().isEmpty()) {
+                log.warn("사용자 {} ({})의 이메일 주소가 없어 알림을 건너뜝니다.", user.getId(), user.getName());
+                continue;
+            }
+
+            // 사용자의 모든 활성 스케줄을 가져옴 (우선순위 계산 없이)
+            // getUserSchedulesWithPriority 대신 getUserSchedules 사용
+            List<ScheduleListDto> userSchedules = getUserSchedules(user.getId().toString());
+
+            // 알림 대상 스케줄 필터링 및 남은 날짜별로 그룹화 (0, 1, 3, 7일 후 시작)
+            Map<Integer, List<ScheduleListDto>> remindersByDays = userSchedules.stream()
+                    // 시작일자가 null이 아니고, 오늘 또는 이후 시작하는 스케줄만 필터링
+                    .filter(schedule -> schedule.getStartDate() != null && !schedule.getStartDate().isBefore(startOfToday))
+                    // 시작일자와 오늘 날짜의 차이(일 단위)를 계산하여 그룹핑
+                    .collect(Collectors.groupingBy(schedule -> {
+                        long days = ChronoUnit.DAYS.between(startOfToday, schedule.getStartDate().truncatedTo(ChronoUnit.DAYS));
+                        if (days == 0) return 0; // 오늘 시작
+                        if (days == 1) return 1; // 내일 시작
+                        if (days == 3) return 3; // 3일 후 시작
+                        if (days == 7) return 7; // 7일 후 시작
+                        return -1; // 알림 대상 날짜가 아니면 -1 그룹으로 (필터링되지 않은 경우)
+                    }));
+
+            // 각 알림 대상 날짜(0, 1, 3, 7일)별로 이메일 발송
+            int[] notificationDays = {0, 1, 3, 7}; // 알림 보낼 남은 날짜 기준
+            for (int days : notificationDays) {
+                // 해당 날짜에 해당하는 스케줄 목록을 가져옴. 없으면 빈 리스트 반환.
+                List<ScheduleListDto> schedulesToSend = remindersByDays.getOrDefault(days, Collections.emptyList());
+
+                // 해당 날짜에 스케줄이 있는 경우에만 이메일 발송
+                if (!schedulesToSend.isEmpty()) {
+                    // 요구사항에 맞춰 스케줄 정렬 (제목 알파벳 순으로만 정렬)
+                    // User 객체는 더 이상 정렬 로직에 사용되지 않지만, 메소드 시그니처 유지를 위해 전달
+                    sortSchedulesForEmail(schedulesToSend, user);
+
+                    // 이메일 제목 생성
+                    String subject = String.format("Priorify 스케줄 알림: %s 후 시작", (days == 0 ? "오늘" : (days == 1 ? "내일" : days + "일")));
+
+                    // 이메일 발송 시도
+                    try {
+                        emailService.sendScheduleReminderEmail(user.getEmail(), subject, schedulesToSend, days);
+                        log.info("사용자 {} ({})에게 {}일 후 스케줄 알림 이메일 발송 완료 (스케줄 {}개)", user.getId(), user.getName(), days, schedulesToSend.size());
+                    } catch (javax.mail.MessagingException e) { // Spring Boot 2.7 이므로 javax.mail.MessagingException 임포트 사용
+                        log.error("사용자 {} ({})에게 {}일 후 스케줄 알림 이메일 발송 실패: {}", user.getId(), user.getName(), days, e.getMessage());
+                    } catch (Exception e) { // 혹시 모를 다른 예외 처리
+                        log.error("사용자 {} ({})에게 {}일 후 스케줄 알림 이메일 발송 중 예상치 못한 오류 발생: {}", user.getId(), user.getName(), days, e.getMessage());
+                    }
+                }
+            }
+        }
+        log.info("스케줄 알림 작업 종료");
+    }
+
+
+
+    /**
+     * 알림 이메일 발송을 위한 스케줄 목록 정렬 로직
+     * 정렬 기준:
+     * (남은 날짜는 이미 sendDailyScheduleReminders에서 그룹화 됨)
+     * 1. 제목 알파벳 순 (오름차순)
+     * 이 메소드는 sendDailyScheduleReminders에서 호출되며, 이미 특정 남은 날짜 그룹에 속한 스케줄 리스트를 받습니다.
+     */
+    private void sortSchedulesForEmail(List<ScheduleListDto> schedules, User user) {
+
+        // 남은 날짜별 그룹 내에서 제목 알파벳 순으로만 정렬
+        schedules.sort(Comparator
+                // 1. 제목 알파벳 순 오름차순 (null 처리 포함)
+                // 제목이 null인 경우 빈 문자열("")로 간주하여 비교합니다.
+                .comparing(schedule -> schedule.getTitle() != null ? schedule.getTitle() : "", Comparator.naturalOrder())
+        );
+    }
+}

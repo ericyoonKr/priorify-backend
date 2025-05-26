@@ -35,7 +35,11 @@ dependencies {
 	implementation 'com.google.api-client:google-api-client:2.0.0'
     implementation 'com.google.oauth-client:google-oauth-client-jetty:1.34.1'
     implementation 'com.google.apis:google-api-services-calendar:v3-rev20220715-2.0.0'
-	
+
+	// Spring Boot Starter for email
+	// Haven't edited application.yaml yet.
+	implementation 'org.springframework.boot:spring-boot-starter-mail'
+
 	//RX
 	implementation 'io.reactivex.rxjava3:rxjava:3.1.10'
 
